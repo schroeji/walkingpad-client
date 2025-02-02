@@ -1,8 +1,11 @@
 import asyncio
 import bleak
-import time
 import struct
+import time
+import threading
 from bleak import BleakClient
+from i3pystatus import IntervalModule, formatp
+from i3pystatus.core.color import ColorRangeModule
 
 
 class TreadmillDataClient(object):
@@ -31,7 +34,6 @@ class TreadmillDataClient(object):
         return struct.unpack('h', bytes(byte_array[:2]))[0], byte_array[2:]
 
     def parse_treadmill_data(self, byte_array):
-        print(f"Received data: {byte_array.hex()}")
         # Ensure we have at least two bytes for the flags
         if len(byte_array) < 2:
             raise ValueError("Input byte array is too short to contain valid flags")
@@ -146,26 +148,28 @@ class FitnessMachineControlPoint(object):
 class TreadmillController(object):
     control_point = None
     treadmill_data_client = None
+    logger = None 
     client = None
+
+    def __init__(self, logger):
+        self.logger = logger 
 
     async def connect(self):
         DEVICE_NAME = "EsangLinker"
-        # scanner = bleak.BleakScanner()
-        # devices = await scanner.discover()
-        # walking_pad = None
-        # for device in devices:
-        #     print(device)
-        #     if(device.name == DEVICE_NAME):
-        #         walking_pad = device
-        #         print("Found walking pad:" + walking_pad.address + " " + walking_pad.name)
-        #         print(walking_pad.details)
-        #         break
-        # if(walking_pad is None):
-        #     print("Walking pad not found")
-        #     return None
-        self.client = BleakClient("6E:28:10:4B:48:5E ")
+        scanner = bleak.BleakScanner()
+        devices = await scanner.discover()
+        walking_pad = None
+        for device in devices:
+            if(device.name == DEVICE_NAME):
+                walking_pad = device
+                self.logger.debug("Found walking pad: " + walking_pad.address + " " + walking_pad.name)
+                break
+        if(walking_pad is None):
+            self.logger.error("Walking pad not found")
+            return None
+        self.client = BleakClient(walking_pad.address)
         await self.client.connect()
-        # print("Connected to " + walking_pad.address)
+        self.logger.info("Connected to " + walking_pad.address)
         try: 
             characteristics = await self.get_all_characteristics()
             control_point_characteristic = self.get_fitness_machine_control_point_characteristic(characteristics)
@@ -174,14 +178,14 @@ class TreadmillController(object):
             self.treadmill_data_client = TreadmillDataClient(self.client, treadmill_data_characteristic)
 
         except Exception as e:
-            print(e)
+            self.logger.exception("Failed to connect.")
             await self.client.disconnect()
             return
 
 
     async def get_all_characteristics(self):
         if(self.client is None):
-            print("Client not connected")
+            self.logger.error("Client not connected")
             return []   
         characteristics = []
         for service in self.client.services:
@@ -195,7 +199,7 @@ class TreadmillController(object):
                 continue    
             if char.uuid[:8] == "00002ad9":
                 return char
-        print("Fitness Machine Control Point characteristic not found")
+        self.logger.error("Fitness Machine Control Point characteristic not found")
         return None
         
     def get_treadmill_data_characteristic(self, characteristics):
@@ -204,71 +208,125 @@ class TreadmillController(object):
                 continue    
             if char.uuid[:8] == "00002acd":
                 return char
-        print("Treadmill Data characteristic not found")
+        self.logger.error("Treadmill Data characteristic not found")
         return None
  
-class Treadmill():
+class Treadmill(IntervalModule, ColorRangeModule):
     settings = (
         ("format", "format string"),
     )
-    format = "Speed: {instantaneous_speed} Dist: {total_distance}"
+    format = "{instantaneous_speed}km/h {total_distance}m"
     controller = None
     data = {}
     output = {}
     event_loop = None
-    pause_disconnect_timeout = 60
+    interval = 1
+    on_leftclick = "pause_resume"
+    on_rightclick = "close"
+    on_upscroll = "increment_speed"
+    on_downscroll = "decrement_speed"
+    pause_disconnect_timeout = 300
     pause_start = None
+    is_inactive = False
+    task_queue = []
+    thread = None
+
+    def update_thread(self):
+        self.logger.info("Starting update thread")
+        while True:
+            self.logger.debug("Entering run " + str(self.pause_start))
+            if not self.is_inactive and (self.controller.client is None or not self.controller.client.is_connected):
+                self.pause_start = None
+                self.event_loop.run_until_complete(self.controller.connect())
+
+            if self.controller.client is None or not self.controller.client.is_connected:
+                format_str = "Treadmill not connected."
+                self.data = {}
+            else:
+                try:
+                    while len(self.task_queue) > 0:
+                        task = self.task_queue.pop(0)
+                        self.logger.info("Executing scheduled task.")
+                        self.event_loop.run_until_complete(task)
+                    self.data = self.event_loop.run_until_complete(self.controller.treadmill_data_client.read())
+                    if self.data["instantaneous_speed"] == 0:
+                        if self.pause_start is None:
+                            self.pause_start = time.time()
+                            self.logger.info("Starting paused timeout.")
+                        elif time.time() - self.pause_start > self.pause_disconnect_timeout:
+                            self.event_loop.run_until_complete(self.controller.client.disconnect())
+                            self.is_inactive = True
+                            self.logger.info("Disconnected from treadmill due to inactivity.")
+                    else:
+                        self.pause_start = None
+
+                    format_str = self.format
+
+                    data = self.data.copy()
+                    # Convert speed to km/h
+                    data["instantaneous_speed"] = data["instantaneous_speed"] / 100
+                    self.output = {
+                        "full_text": formatp(format_str, **data).strip(),
+                        'color': "E7BA3C"
+                    }
+                except Exception as e:
+                    self.logger.error("Error in update_thread" + str(e))
+                    self.data = {}
+                    format_str = "Error reading treadmill data."
+                    self.output = {
+                        "full_text": format_str,
+                        'color': "FF0000"
+                    }
+                    break
+            time.sleep(self.interval)
+        self.controller.treadmill.close()
+        self.logger.debug("Exiting run")
+
 
     def init(self):
         self.event_loop = asyncio.new_event_loop()
-        self.controller = TreadmillController()
+        self.controller = TreadmillController(self.logger)
+        self.thread = threading.Thread(target=self.update_thread, daemon=True)
+        self.thread.start()
 
     def run(self):
-        if self.controller.client is None or not self.controller.client.is_connected:
-            self.event_loop.run_until_complete(self.controller.connect())
-        if self.controller.client is None or not self.controller.client.is_connected:
-            format_str = "Treadmill not connected."
-            self.data = {}
-        else:
-            self.data = self.event_loop.run_until_complete(self.controller.treadmill_data_client.read())
-            if self.data["instantaneous_speed"] == 0:
-                if self.pause_start is None:
-                    self.pause_start = time.time()
-                elif time.time() - self.pause_start > self.pause_disconnect_timeout:
-                    self.event_loop.run_until_complete(self.controller.client.disconnect())
-            format_str = self.format
-
-        self.output = {
-            "full_text": format_str.format(**self.data),
-            'color': "E7BA3C"
-        }
-        print(self.output)
+        pass
     
     def pause_resume(self):
+        self.logger.info("Pause/Resume")
+        if self.is_inactive:
+            self.logger.info("Reconnecting")
+            self.is_inactive = False
+            self.task_queue.append(self.event_loop.create_task(self.controller.control_point.send_resume_command()))
+            return
+
+        if "instantaneous_speed" not in self.data:
+            self.logger.info("Failed to resume.")
+            return
+
         if self.data["instantaneous_speed"] == 0:
-            self.event_loop.create_task(self.controller.control_point.send_resume_command())
+            self.task_queue.append(self.event_loop.create_task(self.controller.control_point.send_resume_command()))
+            self.logger.info("Created resume task")
         else: 
-            self.event_loop.create_task(self.controller.control_point.send_pause_command())
+            self.task_queue.append(self.event_loop.create_task(self.controller.control_point.send_pause_command()))
+            self.logger.info("Created pause task")
+        self.logger.info("Returning from pause_resume")
 
     def increment_speed(self):
-        new_speed = self.data["instantaneous_speed"] + 50
-        self.event_loop.create_task(self.controller.control_point.set_speed(new_speed))
+        if "instantaneous_speed" not in self.data:
+            self.logger.info("Failed to increment speed.")
+            return
+        new_speed = self.data["instantaneous_speed"] + 10
+        self.task_queue.append(self.event_loop.create_task(self.controller.control_point.set_speed(new_speed)))
         self.data["instantaneous_speed"] = new_speed
 
     def decrement_speed(self):
-        new_speed = self.data["instantaneous_speed"] - 50
+        if "instantaneous_speed" not in self.data:
+            self.logger.info("Failed to decrement speed.")
+            return
+        new_speed = self.data["instantaneous_speed"] - 10
         self.event_loop.create_task(self.controller.control_point.set_speed(new_speed))
         self.data["instantaneous_speed"] = new_speed
 
     def close(self):
-        self.event_loop.run_until_complete(self.controller.client.disconnect())
-
-if __name__ == "__main__":
-    treadmill = Treadmill()
-    try:
-        treadmill.init()
-        treadmill.run()
-    except Exception as e:
-        print(e)
-    finally:
-        treadmill.close()
+        self.event_loop.create_task(self.controller.client.disconnect())
